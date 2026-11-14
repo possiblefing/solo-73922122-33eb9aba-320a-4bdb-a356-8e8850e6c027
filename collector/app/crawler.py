@@ -16,6 +16,21 @@ Concurrency and rate-limit contract:
   requests and the connection pool, and only then flips the state to stopped
   and permits a new round. A round id guards against a late response from the
   old round being written into the new one.
+
+Resume ("补采缺页") contract:
+
+* Resume is only offered for a round that *finished* as ``partial`` — and a
+  resume that is stopped or fails leaves the round ``partial`` again, so
+  every still-unfinished page stays resumable.
+* A resume re-fetches only the unfinished list and detail pages. Once a list
+  page parses, any list page of that section that never completed is patched
+  too, and details discovered there that have not succeeded yet are enqueued
+  and merged into the original round by announcement code. The round keeps
+  its id, records and progress; the unfinished list is rebuilt by the resume.
+* While a resume runs, no new round and no second resume may start, and
+  downloads keep reporting the round as incomplete. Only when every missing
+  page and every newly discovered detail has succeeded does the round flip
+  to ``completed``.
 """
 
 from __future__ import annotations
@@ -66,11 +81,13 @@ class UnfinishedPage:
 @dataclass
 class RoundState:
     round_id: str | None = None
-    status: str = "idle"  # idle | running | stopping | stopped | completed | partial
+    # idle | running | stopping | resuming | stopped | completed | partial
+    status: str = "idle"
     base_url: str = ""
     started_at: str | None = None
     finished_at: str | None = None
     stop_requested: bool = False
+    resume_count: int = 0
     pages_enqueued: int = 0
     pages_completed: int = 0
     pages_failed: int = 0
@@ -99,6 +116,14 @@ class Crawler:
 
         # Site-wide 429 cooldown (one clock for the whole crawler).
         self._cooldown_until = 0.0
+
+        # Resume ("补采") bookkeeping. ``_list_pages_done`` survives a resume
+        # so a re-fetched page 1 only patches list pages that never completed;
+        # the two enqueue sets dedupe jobs within one resume.
+        self._resume_mode = False
+        self._list_pages_done: dict[str, set[int]] = {name: set() for name in sections}
+        self._resume_enqueued_lists: set[tuple[str, str]] = set()
+        self._resume_enqueued_details: set[str] = set()
 
         self.state = RoundState(
             base_url=self.base_url,
@@ -135,6 +160,10 @@ class Crawler:
             self._cooldown_until = 0.0
             self._records: dict[str, dict] = {}
             self._seen_codes: set[str] = set()
+            self._resume_mode = False
+            self._list_pages_done = {name: set() for name in self.sections}
+            self._resume_enqueued_lists = set()
+            self._resume_enqueued_details = set()
 
             self.state = RoundState(
                 round_id=round_id,
@@ -151,8 +180,96 @@ class Crawler:
                 headers={"User-Agent": "procurement-collector/1.0"},
                 follow_redirects=True,
             )
+            initial_jobs = [
+                {"section": name, "kind": "list", "page": 1, "url": path, "attempts": 0}
+                for name, path in self.sections.items()
+            ]
+            self.state.pages_enqueued += len(initial_jobs)
             self._log(f"round {round_id} started; columns={list(self.sections)}")
-            self._round_task = asyncio.create_task(self._run_round(round_id))
+            self._round_task = asyncio.create_task(self._run_round(round_id, initial_jobs))
+            return round_id
+
+    async def start_resume(self) -> str:
+        """Re-fetch only the unfinished pages of a finished ``partial`` round.
+
+        The round keeps its id, records and section progress; pages that
+        succeed merge into it by announcement code. The unfinished list is
+        rebuilt by the resume, so anything that fails or is stopped stays
+        available for the next resume.
+        """
+        async with self._round_lock:
+            if self._round_task is not None and not self._round_task.done():
+                raise RuntimeError("a collection round is already running")
+            if self.state.status != "partial":
+                raise RuntimeError(
+                    "resume is only available for a finished partial round "
+                    f"(current status: {self.state.status})"
+                )
+            if not self.state.unfinished:
+                raise RuntimeError("the round has no unfinished pages to resume")
+
+            round_id = self.state.round_id
+            assert round_id is not None  # a partial round always has one
+
+            self._stop_event = asyncio.Event()
+            self._inflight = asyncio.Semaphore(MAX_IN_FLIGHT)
+            self._cooldown_until = 0.0
+            self._resume_mode = True
+            self._resume_enqueued_lists = set()
+            self._resume_enqueued_details = set()
+
+            jobs: list[dict] = []
+            for page in self.state.unfinished:
+                if page.page_type == "list":
+                    key = (page.section, page.page)
+                    if key in self._resume_enqueued_lists:
+                        continue
+                    self._resume_enqueued_lists.add(key)
+                    jobs.append(
+                        {
+                            "section": page.section,
+                            "kind": "list",
+                            "page": int(page.page),
+                            "url": self._relative(page.url),
+                            "attempts": 0,
+                        }
+                    )
+                else:
+                    code = page.page
+                    if code in self._records or code in self._resume_enqueued_details:
+                        continue
+                    self._resume_enqueued_details.add(code)
+                    jobs.append(
+                        {
+                            "section": page.section,
+                            "kind": "detail",
+                            "page": code,
+                            "url": self._relative(page.url),
+                            "attempts": 0,
+                        }
+                    )
+
+            # Records stay visible; the unfinished list is rebuilt below.
+            self.state.unfinished = []
+            self.state.status = "resuming"
+            self.state.finished_at = None
+            self.state.stop_requested = False
+            self.state.resume_count += 1
+            self.state.pages_enqueued += len(jobs)
+
+            # Fresh client/pool for the resume; limits from earlier activity
+            # do not carry over.
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self.timeout),
+                headers={"User-Agent": "procurement-collector/1.0"},
+                follow_redirects=True,
+            )
+            self._log(
+                f"resume #{self.state.resume_count} of round {round_id} started: "
+                f"{len(jobs)} unfinished page(s) queued"
+            )
+            self._round_task = asyncio.create_task(self._run_round(round_id, jobs))
             return round_id
 
     async def stop_round(self) -> None:
@@ -193,17 +310,14 @@ class Crawler:
             self._log("in-flight requests closed and connections recycled; round stopped")
 
     # ----------------------------------------------------------------- round
-    async def _run_round(self, round_id: str) -> None:
+    async def _run_round(self, round_id: str, initial_jobs: list[dict]) -> None:
         # Mutable holder so both the coordinator and workers can track the
         # number of jobs queued or being processed.
         pending = {"count": 0}
         queue: asyncio.Queue = asyncio.Queue()
-        for name, path in self.sections.items():
-            queue.put_nowait(
-                {"section": name, "kind": "list", "page": 1, "url": path, "attempts": 0}
-            )
+        for job in initial_jobs:
+            queue.put_nowait(job)
             pending["count"] += 1
-            self.state.pages_enqueued += 1
 
         workers = [
             asyncio.create_task(self._worker(round_id, queue, i, pending))
@@ -246,15 +360,21 @@ class Crawler:
             return
 
         self.state.finished_at = datetime.now(timezone.utc).isoformat()
-        if self._stop_event.is_set():
+        if self._resume_mode:
+            # A resume never shows "stopped": whatever is still unfinished
+            # (failed again, or never sent because of a stop) keeps the round
+            # partial and resumable; records already collected stay visible.
+            # Only a fully patched round may show completed.
+            self.state.status = "partial" if self.state.unfinished else "completed"
+        elif self._stop_event.is_set():
             self.state.status = "stopped"
-        elif self.state.pages_failed:
+        elif self.state.unfinished:
             self.state.status = "partial"
         else:
             self.state.status = "completed"
         self.state.records_count = len(self._records)
         self._log(
-            f"round ended: status={self.state.status}, "
+            f"{'resume' if self._resume_mode else 'round'} ended: status={self.state.status}, "
             f"records={self.state.records_count}, unfinished={len(self.state.unfinished)}"
         )
 
@@ -305,11 +425,23 @@ class Crawler:
 
         progress.list_completed += 1
         self.state.pages_completed += 1
+        self._list_pages_done[section].add(job["page"])
+        if job["page"] == 1:
+            progress.list_total_pages = result.total_pages
 
         spawned = 0
         if job["page"] == 1:
-            progress.list_total_pages = result.total_pages
+            # Patch every list page of this section that has never completed.
+            # In a fresh round that is all of pages 2..N; in a resume only
+            # the pages still missing (e.g. never discovered because page 1
+            # had failed). Pages already queued by this resume are skipped.
             for page_no in range(2, result.total_pages + 1):
+                if page_no in self._list_pages_done[section]:
+                    continue
+                key = (section, str(page_no))
+                if key in self._resume_enqueued_lists:
+                    continue
+                self._resume_enqueued_lists.add(key)
                 new_job = {
                     "section": section,
                     "kind": "list",
@@ -322,10 +454,18 @@ class Crawler:
                 self.state.pages_enqueued += 1
 
         for item in result.items:
-            if item.code in self._seen_codes:
-                progress.duplicated_skipped += 1
-                continue
-            self._seen_codes.add(item.code)
+            if self._resume_mode:
+                # Only details that have not succeeded yet are re-collected;
+                # anything already in the records stays untouched.
+                if item.code in self._records or item.code in self._resume_enqueued_details:
+                    progress.duplicated_skipped += 1
+                    continue
+                self._resume_enqueued_details.add(item.code)
+            else:
+                if item.code in self._seen_codes:
+                    progress.duplicated_skipped += 1
+                    continue
+                self._seen_codes.add(item.code)
             queue.put_nowait(
                 {
                     "section": section,
@@ -468,6 +608,14 @@ class Crawler:
         if url.startswith(("http://", "https://")):
             return url
         return f"{self.base_url}/{url.lstrip('/')}"
+
+    def _relative(self, url: str) -> str:
+        # Inverse of _absolute: turn a stored absolute URL back into the
+        # client-relative path used by jobs.
+        prefix = f"{self.base_url}/"
+        if url.startswith(prefix):
+            return url[len(self.base_url):]
+        return url
 
     def _mark_unfinished(self, job: dict, reason: str, attempts: int) -> None:
         page_type = job["kind"]

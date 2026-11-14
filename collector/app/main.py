@@ -1,4 +1,4 @@
-"""FastAPI entry point: start / monitor / stop a single collection round."""
+"""FastAPI entry point: start / monitor / stop / resume a collection round."""
 
 from __future__ import annotations
 
@@ -36,6 +36,16 @@ async def start_round() -> dict:
     return {"round_id": round_id, "state": crawler.snapshot()}
 
 
+@app.post("/api/rounds/resume")
+async def resume_round() -> dict:
+    """补采缺页：仅对已结束的 partial 轮次（含补采停止后）开放。"""
+    try:
+        round_id = await crawler.start_resume()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"round_id": round_id, "state": crawler.snapshot()}
+
+
 @app.post("/api/rounds/stop")
 async def stop_round() -> dict:
     await crawler.stop_round()
@@ -66,6 +76,9 @@ async def download_records():
     payload = {
         "round_id": state["round_id"],
         "status": state["status"],
+        # 补采期间及未补齐前，下载结果必须仍标为未完成。
+        "complete": state["status"] == "completed",
+        "resume_count": state["resume_count"],
         "base_url": state["base_url"],
         "started_at": state["started_at"],
         "finished_at": state["finished_at"],
